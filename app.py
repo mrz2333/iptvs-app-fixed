@@ -406,14 +406,26 @@ def process_hsmdtv_channels(host, source_label, source_index):
     std_map = get_standard_channel_map()
     try:
         lines = None
+        # 读缓存文件；若文件里的 host 与当前 host 不一致（源换了），则视为失效并重探，
+        # 避免"源换 host 后仍用旧地址"导致该源全废。
         if os.path.exists(HSMD_ADDRESS_LIST_FILE):
             with open(HSMD_ADDRESS_LIST_FILE, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-        else:
-            # 文件缺失：自动探测并生成（自给自足，避免每次刷 "not found" 日志）
+            cached_host = None
+            for _l in lines:
+                _m = re.search(r'http://([^\s/]+)', _l)
+                if _m:
+                    cached_host = _m.group(1)
+                    break
+            if cached_host and cached_host != host:
+                print(f"hsmdtv: cached host {cached_host} != current {host}, re-probing.")
+                lines = None
+
+        if not lines:
+            # 文件缺失或 host 已变：自动探测并生成（自给自足，避免每次刷 "not found" 日志）
             probed = probe_hsmdtv_channels(host)
             if probed:
-                lines = [f"{name} http://{host}{uri}\n" for name, uri in probed]
+                lines = [f"hsmd-{name.replace('频道','')} http://{host}{uri}\n" for name, uri in probed]
                 try:
                     with open(HSMD_ADDRESS_LIST_FILE, 'w', encoding='utf-8') as f:
                         f.writelines(lines)
