@@ -5,6 +5,7 @@ import time
 import os
 import sys
 import re
+import gc
 import threading
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +38,8 @@ global_m3u8_content = ""
 global_txt_content = ""
 last_run_time = "Never"
 is_running = False
+# 全局锁：防止 /forceRetest 与定时任务并发执行 scheduled_task 造成内存翻倍
+_task_lock = threading.Lock()
 
 def get_standard_channel_map():
     """Returns a dict mapping 'normalized' names to standard names from channel_list.txt."""
@@ -66,10 +69,11 @@ def fetch_api_data():
     for attempt in range(3):
         try:
             print(f"Fetching API data (Attempt {attempt+1})...")
-            response = requests.get(API_URL, timeout=10)
-            if response.status_code == 200:
-                print("API data fetched successfully.")
-                return response.json()
+            # 用 with 确保响应体关闭，避免连接/缓冲区泄漏
+            with requests.get(API_URL, timeout=10) as response:
+                if response.status_code == 200:
+                    print("API data fetched successfully.")
+                    return response.json()
         except Exception as e:
             print(f"API fetch error: {e}")
         time.sleep(5)
@@ -117,11 +121,11 @@ def get_ts_url(m3u8_url):
     Returns the full TS URL.
     """
     try:
-        response = requests.get(m3u8_url, timeout=5)
-        if response.status_code != 200:
-            return None
-        
-        lines = response.text.strip().split('\n')
+        with requests.get(m3u8_url, timeout=5) as response:
+            if response.status_code != 200:
+                return None
+            
+            lines = response.text.strip().split('\n')
         for line in lines:
             line = line.strip()
             if line and not line.startswith('#'):
@@ -161,8 +165,12 @@ def test_host_speed(item):
             try:
                 # Use short timeout for JSON fetch as per iptv.py logic (0.5s there, maybe generic 2s here)
                 response = requests.get(json_url, timeout=2)
-                if response.status_code == 200:
-                    json_data = response.json()
+                try:
+                    ok = response.status_code == 200
+                    json_data = response.json() if ok else None
+                finally:
+                    response.close()
+                if ok:
                     valid_channel_url = None
                     
                     if 'data' in json_data:
@@ -214,8 +222,12 @@ def test_host_speed(item):
             json_url = f"http://{host}/streamer/list"
             try:
                 response = requests.get(json_url, timeout=2)
-                if response.status_code == 200:
-                    json_data = response.json()
+                try:
+                    ok = response.status_code == 200
+                    json_data = response.json() if ok else None
+                finally:
+                    response.close()
+                if ok:
                     valid_channel_url = None
                     for item in json_data:
                         name = item.get('name', '').strip()
@@ -246,8 +258,12 @@ def test_host_speed(item):
             # Referencing ZHGXTV.py: Fetch live_interface.txt first
             interface_url = f"http://{host}{ZHGXTV_INTERFACE}"
             target_response = requests.get(interface_url, timeout=5)
-            if target_response.status_code == 200:
-                content = target_response.content.decode('utf-8', errors='ignore')
+            try:
+                ok = target_response.status_code == 200
+                content = target_response.content.decode('utf-8', errors='ignore') if ok else ""
+            finally:
+                target_response.close()
+            if ok:
                 lines = content.split('\n')
                 
                 valid_channel_url = None
@@ -459,6 +475,21 @@ def channel_sort_key(name):
 
 def scheduled_task():
     global global_m3u8_content, global_txt_content, last_run_time, is_running
+    # 加锁 + 重入检查：定时任务与 /forceRetest 手动触发并发时，第二个直接跳过，
+    # 防止多份完整数据副本同时在内存中导致消耗翻倍。
+    if not _task_lock.acquire(blocking=False):
+        print("Task already running, skip this trigger.")
+        return
+    try:
+        _run_scheduled_task()
+    finally:
+        _task_lock.release()
+        # 任务结束主动回收，避免 CPython 堆碎片/未归还页长期驻留
+        gc.collect()
+
+
+def _run_scheduled_task():
+    global global_m3u8_content, global_txt_content, last_run_time, is_running
     is_running = True
     print("Executing scheduled task...")
     last_run_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -485,6 +516,10 @@ def scheduled_task():
             item = future_to_item[future]
             try:
                 speed, channels = future.result()
+                # 内存优化：channels 可能包含上百个频道的 name+url，只有最终入选
+                # top_sources 的源才会用到它。这里先只保留轻量的测速结果，
+                # channels 放回 future 引用、用完随 future 一起释放，
+                # 避免所有源的频道数据同时驻留内存。
                 if speed > 0:
                     print(f"Host {item['host']} Speed: {speed:.2f} MB/s matchType: {item['matchType']} source: {item.get('source', 'N/A')}")
                     results_with_speed.append({
@@ -493,8 +528,13 @@ def scheduled_task():
                         'speed': speed,
                         'channels': channels
                     })
+                else:
+                    # 慢速源的频道数据不保留
+                    channels = None
             except Exception as e:
                 print(f"Error testing {item['host']}: {e}")
+    # 释放测速阶段的引用集合与线程池结果包装
+    del future_to_item
 
     # Sort and pick top N
     
@@ -725,10 +765,12 @@ def get_m3u8():
 @app.route('/forceRetest')
 def force_retest():
     global is_running
-    if is_running:
+    # 用锁做原子判断，避免「检查-启动」之间的竞态窗口里被连点出多个线程
+    if is_running or _task_lock.locked():
          return jsonify({"message": "Update already in progress.", "status": "busy"}), 429
          
-    threading.Thread(target=scheduled_task).start()
+    t = threading.Thread(target=scheduled_task, daemon=True)
+    t.start()
     return jsonify({"message": "Force retest started in background.", "status": "started"})
 
 # Initial run in background on startup (or trigger manually)
@@ -738,7 +780,7 @@ def start_scheduler():
     scheduler.start()
     
     # Run immediately in a separate thread to not block startup
-    threading.Thread(target=scheduled_task).start()
+    threading.Thread(target=scheduled_task, daemon=True).start()
 
 if __name__ == '__main__':
     print(f"Starting... - Version: {VERSION}")
