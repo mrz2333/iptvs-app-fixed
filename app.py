@@ -555,6 +555,13 @@ def _run_scheduled_task():
         is_running = False
         return
 
+    # 过滤掉 hsmdtv 源：其频道名无法从流中获取，缺失 hsmd_address_list.txt 时
+    # 只会产出无意义的数字台，故直接排除在测速候选外（省时且避免污染列表）。
+    before = len(result)
+    result = [r for r in result if r.get('matchType') != 'hsmdtv']
+    if len(result) < before:
+        print(f"Filtered out {before - len(result)} hsmdtv source(s).")
+
     # Speed test in parallel
     results_with_speed = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -595,7 +602,9 @@ def _run_scheduled_task():
     selected_hosts = set()
     
     # Ensure at least one from each type if available and fast enough
-    required_matches = ['txiptv', 'hsmdtv', 'zhgxtv', 'jsmpeg']
+    # 注: hsmdtv 已移除 —— 其频道名依赖 hsmd_address_list.txt（流内不含台名），
+    # 缺失时只能出无意义的数字台，故不再为其保留名额，让位给能出真名的源。
+    required_matches = ['txiptv', 'zhgxtv', 'jsmpeg']
     
     for m in required_matches:
         # Find best for this match type
