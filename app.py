@@ -405,37 +405,13 @@ def process_hsmdtv_channels(host, source_label, source_index):
     entries = []
     std_map = get_standard_channel_map()
     try:
-        lines = None
-        # 读缓存文件；若文件里的 host 与当前 host 不一致（源换了），则视为失效并重探，
-        # 避免"源换 host 后仍用旧地址"导致该源全废。
-        if os.path.exists(HSMD_ADDRESS_LIST_FILE):
-            with open(HSMD_ADDRESS_LIST_FILE, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            cached_host = None
-            for _l in lines:
-                _m = re.search(r'http://([^\s/]+)', _l)
-                if _m:
-                    cached_host = _m.group(1)
-                    break
-            if cached_host and cached_host != host:
-                print(f"hsmdtv: cached host {cached_host} != current {host}, re-probing.")
-                lines = None
-
-        if not lines:
-            # 文件缺失或 host 已变：自动探测并生成（自给自足，避免每次刷 "not found" 日志）
-            probed = probe_hsmdtv_channels(host)
-            if probed:
-                lines = [f"hsmd-{name.replace('频道','')} http://{host}{uri}\n" for name, uri in probed]
-                try:
-                    with open(HSMD_ADDRESS_LIST_FILE, 'w', encoding='utf-8') as f:
-                        f.writelines(lines)
-                    print(f"Auto-generated {HSMD_ADDRESS_LIST_FILE} ({len(lines)} channels) from host {host}")
-                except Exception as we:
-                    print(f"Could not cache {HSMD_ADDRESS_LIST_FILE}: {we}")
-            else:
-                # 探测不到就静默跳过（原版会每次刷 not found）
-                print(f"hsmdtv: no channels discovered from {host}, skipped.")
-                return []
+        # hsmdtv 的频道名只能来自 hsmd_address_list.txt（流里不含台名）。
+        # 该文件未随项目提供，需用户自备（每行: "频道名 http://host/newlive/live/hls/N/live.m3u8"）。
+        # 文件缺失时与原版一致：不生成 hsmdtv 频道（避免出现无意义的数字台），仅静默跳过日志。
+        if not os.path.exists(HSMD_ADDRESS_LIST_FILE):
+            return []
+        with open(HSMD_ADDRESS_LIST_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
 
         for line in lines:
             line = line.strip()
