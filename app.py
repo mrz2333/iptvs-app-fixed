@@ -23,11 +23,22 @@ app = Flask(__name__)
 
 # Constants
 API_URL = "https://iptvs.pes.im"
-CACHE_FILE = "iptv_sources.m3u8"
-TXT_CACHE_FILE = "iptv_sources.txt"
-CHANNEL_LIST_FILE = "channel_list.txt"
-ADDRESS_LIST_FILE = "address_list.txt"
-HSMD_ADDRESS_LIST_FILE = "hsmd_address_list.txt"
+# 缓存与配置统一落到挂载卷（WB_DATA_DIR 或默认 /app/data），容器重启后可直接读回，
+# 无需重新拉取+测速。若目录不可写则回退到当前工作目录。
+def _data_path(name):
+    base = os.environ.get("IPTV_DATA_DIR", "/app/data")
+    try:
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, name)
+    except Exception:
+        return name
+
+CACHE_FILE = _data_path("iptv_sources.m3u8")
+TXT_CACHE_FILE = _data_path("iptv_sources.txt")
+CHANNEL_LIST_FILE = os.path.join(os.path.dirname(CACHE_FILE), "channel_list.txt")
+ADDRESS_LIST_FILE = os.path.join(os.path.dirname(CACHE_FILE), "address_list.txt")
+HSMD_ADDRESS_LIST_FILE = os.path.join(os.path.dirname(CACHE_FILE), "hsmd_address_list.txt")
+HSMD_PROBE_MAX = 30  # hsmdtv 自动探测的最大频道号
 ZHGXTV_INTERFACE = "/ZHGXTV/Public/json/live_interface.txt"
 TXIPTV_TEST_URI = "/tsfile/live/0001_1.m3u8"
 HSMDTV_TEST_URI = "/newlive/live/hls/1/live.m3u8"
@@ -362,18 +373,58 @@ def process_txiptv_channels(channels, source_label, source_index):
         print(f"Error processing txiptv channels: {e}")
     return entries
 
+def probe_hsmdtv_channels(host, max_channel=HSMD_PROBE_MAX):
+    """
+    当 hsmd_address_list.txt 缺失时，自动探测 hsmdtv 频道号。
+    hsmdtv 的单频道流地址形如 /newlive/live/hls/{N}/live.m3u8。
+    通过 HEAD/GET 探测哪些频道号可用，生成 (频道名, 路径) 列表。
+    仅探测一次并缓存到文件，避免每次都扫。
+    """
+    found = []
+    for n in range(1, max_channel + 1):
+        uri = f"/newlive/live/hls/{n}/live.m3u8"
+        url = f"http://{host}{uri}"
+        try:
+            with requests.get(url, timeout=2, stream=True) as r:
+                if r.status_code != 200:
+                    continue
+                # 只读一点点确认是 m3u8
+                head = r.raw.read(64, decode_content=True) or b""
+                if b"#EXTM3U" in head:
+                    found.append((f"频道{n}", uri))
+        except Exception:
+            continue
+    return found
+
+
 def process_hsmdtv_channels(host, source_label, source_index):
-    """Generates m3u8 entries for hsmdtv source using hsmd_address_list.txt."""
+    """
+    Generates m3u8 entries for hsmdtv source.
+    优先读 hsmd_address_list.txt；文件缺失时自动探测频道号（结果写回该文件作为缓存）。
+    """
     entries = []
     std_map = get_standard_channel_map()
     try:
-        if not os.path.exists(HSMD_ADDRESS_LIST_FILE):
-             print(f"{HSMD_ADDRESS_LIST_FILE} not found.")
-             return []
+        lines = None
+        if os.path.exists(HSMD_ADDRESS_LIST_FILE):
+            with open(HSMD_ADDRESS_LIST_FILE, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        else:
+            # 文件缺失：自动探测并生成（自给自足，避免每次刷 "not found" 日志）
+            probed = probe_hsmdtv_channels(host)
+            if probed:
+                lines = [f"{name} http://{host}{uri}\n" for name, uri in probed]
+                try:
+                    with open(HSMD_ADDRESS_LIST_FILE, 'w', encoding='utf-8') as f:
+                        f.writelines(lines)
+                    print(f"Auto-generated {HSMD_ADDRESS_LIST_FILE} ({len(lines)} channels) from host {host}")
+                except Exception as we:
+                    print(f"Could not cache {HSMD_ADDRESS_LIST_FILE}: {we}")
+            else:
+                # 探测不到就静默跳过（原版会每次刷 not found）
+                print(f"hsmdtv: no channels discovered from {host}, skipped.")
+                return []
 
-        with open(HSMD_ADDRESS_LIST_FILE, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
         for line in lines:
             line = line.strip()
             if not line: continue
@@ -484,8 +535,16 @@ def scheduled_task():
         _run_scheduled_task()
     finally:
         _task_lock.release()
-        # 任务结束主动回收，避免 CPython 堆碎片/未归还页长期驻留
+        # 任务结束主动回收内存：
+        # 1) gc.collect() 清理 Python 对象引用
+        # 2) malloc_trim(0) 把 glibc 空闲堆真正还给操作系统 —— 否则即使 gc 了，
+        #    进程 RSS 也不会下降（这是本服务"跑完测速内存不回落"的关键）
         gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
 
 def _run_scheduled_task():
